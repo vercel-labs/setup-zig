@@ -1,0 +1,50 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Run unit tests
+        run: node --test main.test.mjs
+
+  integration:
+    name: Zig ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Zig
+        id: zig
+        uses: ./
+        with:
+          version: 0.16.0
+
+      - name: Verify Zig
+        shell: bash
+        env:
+          INSTALLED_VERSION: ${{ steps.zig.outputs.version }}
+          ZIG_PATH: ${{ steps.zig.outputs.zig-path }}
+        run: |
+          test "$(zig version)" = "0.16.0"
+          test "$INSTALLED_VERSION" = "0.16.0"
+          test -x "$ZIG_PATH" || test -f "$ZIG_PATH"

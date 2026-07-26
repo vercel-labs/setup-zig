@@ -1,0 +1,25 @@
+name: Setup Zig
+description: Install an exact Zig release and add it to PATH
+author: Vercel Labs
+
+inputs:
+  version:
+    description: Exact Zig release to install, or master for the latest development build
+    required: false
+    default: "0.16.0"
+
+outputs:
+  version:
+    description: The installed Zig version
+  zig-path:
+    description: The absolute path to the Zig executable
+  cache-hit:
+    description: Whether Zig was already present in the runner tool cache
+
+runs:
+  using: node24
+  main: main.mjs
+
+branding:
+  icon: terminal
+  color: gray-dark
