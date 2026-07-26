@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import {
+  createHash,
+  createPublicKey,
+  timingSafeEqual,
+  verify as verifySignature,
+} from "node:crypto";
 import {
   createReadStream,
   createWriteStream,
@@ -22,6 +27,10 @@ const COMMUNITY_MIRRORS_URL =
   "https://ziglang.org/download/community-mirrors.txt";
 const DOWNLOAD_SOURCE = "github-vercel-labs-setup-zig";
 const USER_AGENT = "vercel-labs/setup-zig";
+const ZIG_MINISIGN_PUBLIC_KEY =
+  "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+const CACHE_MARKER_FORMAT = "minisign-v1";
 
 function actionInput(name) {
   return process.env[`INPUT_${name.replaceAll("-", "_").toUpperCase()}`]?.trim();
@@ -149,9 +158,30 @@ async function fetchResponse(url, timeoutMilliseconds) {
   return response;
 }
 
-async function fetchText(url, timeoutMilliseconds = 30_000) {
+async function fetchText(
+  url,
+  timeoutMilliseconds = 30_000,
+  maximumBytes = 2 * 1024 * 1024,
+) {
   const response = await fetchResponse(url, timeoutMilliseconds);
-  return response.text();
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
+    throw new Error(`Response from ${url} exceeds ${maximumBytes} bytes`);
+  }
+  if (!response.body) {
+    throw new Error(`Response from ${url} did not contain a body`);
+  }
+
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of Readable.fromWeb(response.body)) {
+    totalBytes += chunk.length;
+    if (totalBytes > maximumBytes) {
+      throw new Error(`Response from ${url} exceeds ${maximumBytes} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 async function fetchDownloadIndex() {
@@ -213,15 +243,144 @@ export async function sha256(filename) {
   return hash.digest("hex");
 }
 
+function decodeBase64(value, label) {
+  if (
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value,
+    )
+  ) {
+    throw new Error(`Invalid base64 in minisign ${label}`);
+  }
+
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) {
+    throw new Error(`Non-canonical base64 in minisign ${label}`);
+  }
+  return decoded;
+}
+
+function parseMinisign(signatureText, publicKeyBase64) {
+  if (Buffer.byteLength(signatureText, "utf8") > 16 * 1024) {
+    throw new Error("Minisign signature file is unexpectedly large");
+  }
+
+  const lines = signatureText.replaceAll("\r\n", "\n").split("\n");
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  if (
+    lines.length !== 4 ||
+    !lines[0].startsWith("untrusted comment: ") ||
+    !lines[2].startsWith("trusted comment: ")
+  ) {
+    throw new Error("Invalid minisign signature file format");
+  }
+
+  const publicKeyPacket = decodeBase64(publicKeyBase64, "public key");
+  const signaturePacket = decodeBase64(lines[1], "signature");
+  const globalSignature = decodeBase64(lines[3], "global signature");
+  if (publicKeyPacket.length !== 42) {
+    throw new Error("Invalid minisign public key length");
+  }
+  if (signaturePacket.length !== 74) {
+    throw new Error("Invalid minisign signature length");
+  }
+  if (globalSignature.length !== 64) {
+    throw new Error("Invalid minisign global signature length");
+  }
+  if (publicKeyPacket.subarray(0, 2).toString("ascii") !== "Ed") {
+    throw new Error("Unsupported minisign public key algorithm");
+  }
+  if (signaturePacket.subarray(0, 2).toString("ascii") !== "ED") {
+    throw new Error("Zig archive does not use a prehashed minisign signature");
+  }
+
+  const publicKeyId = publicKeyPacket.subarray(2, 10);
+  const signatureKeyId = signaturePacket.subarray(2, 10);
+  if (!timingSafeEqual(publicKeyId, signatureKeyId)) {
+    throw new Error("Minisign signature was made with an unexpected key");
+  }
+
+  const publicKey = createPublicKey({
+    format: "der",
+    key: Buffer.concat([ED25519_SPKI_PREFIX, publicKeyPacket.subarray(10)]),
+    type: "spki",
+  });
+
+  return {
+    globalSignature,
+    publicKey,
+    signature: signaturePacket.subarray(10),
+    trustedComment: lines[2].slice("trusted comment: ".length),
+  };
+}
+
+export async function verifyMinisign(
+  filename,
+  signatureText,
+  expectedArchiveName,
+  publicKeyBase64 = ZIG_MINISIGN_PUBLIC_KEY,
+) {
+  const { globalSignature, publicKey, signature, trustedComment } =
+    parseMinisign(signatureText, publicKeyBase64);
+  const trustedCommentBytes = Buffer.from(trustedComment, "utf8");
+
+  if (
+    !verifySignature(
+      null,
+      Buffer.concat([signature, trustedCommentBytes]),
+      publicKey,
+      globalSignature,
+    )
+  ) {
+    throw new Error("Minisign trusted comment signature verification failed");
+  }
+
+  const trustedCommentFields = trustedComment.split("\t");
+  const signedFileFields = trustedCommentFields.filter((field) =>
+    field.startsWith("file:"),
+  );
+  if (signedFileFields.length !== 1) {
+    throw new Error("Minisign trusted comment does not contain one file field");
+  }
+  const signedArchiveName = signedFileFields[0].slice("file:".length);
+  if (signedArchiveName !== expectedArchiveName) {
+    throw new Error(
+      `Minisign signature is for "${signedArchiveName}", expected "${expectedArchiveName}"`,
+    );
+  }
+  if (!trustedCommentFields.includes("hashed")) {
+    throw new Error("Minisign trusted comment does not mark the file as hashed");
+  }
+
+  const digest = createHash("blake2b512");
+  await pipeline(createReadStream(filename), digest);
+  if (!verifySignature(null, digest.digest(), publicKey, signature)) {
+    throw new Error("Minisign archive signature verification failed");
+  }
+}
+
+function signatureUrlFor(archiveUrl) {
+  const signatureUrl = new URL(archiveUrl);
+  signatureUrl.pathname = `${signatureUrl.pathname}.minisig`;
+  return signatureUrl.href;
+}
+
 async function downloadVerified(officialUrl, expectedChecksum, destination) {
   const urls = await candidateUrls(officialUrl);
   const failures = [];
+  const archiveName = path.posix.basename(new URL(officialUrl).pathname);
 
   for (const url of urls) {
     try {
       await fs.rm(destination, { force: true });
       info(`Downloading Zig from ${new URL(url).origin}`);
       await downloadFile(url, destination);
+      const signatureText = await fetchText(
+        signatureUrlFor(url),
+        30_000,
+        16 * 1024,
+      );
 
       const actualChecksum = await sha256(destination);
       if (actualChecksum !== expectedChecksum.toLowerCase()) {
@@ -229,6 +388,8 @@ async function downloadVerified(officialUrl, expectedChecksum, destination) {
           `SHA-256 mismatch (expected ${expectedChecksum}, received ${actualChecksum})`,
         );
       }
+      await verifyMinisign(destination, signatureText, archiveName);
+      info("Zig checksum and minisign signature verified");
 
       return;
     } catch (error) {
@@ -293,10 +454,13 @@ async function validateInstallation(zigPath, expectedVersion) {
   }
 }
 
-async function pathExists(filename) {
+async function hasVerifiedCacheMarker(installDirectory, version) {
   try {
-    await fs.access(filename);
-    return true;
+    const marker = await fs.readFile(
+      path.join(installDirectory, ".complete"),
+      "utf8",
+    );
+    return marker.trim() === `${CACHE_MARKER_FORMAT}:${version}`;
   } catch {
     return false;
   }
@@ -358,7 +522,10 @@ export async function setup() {
   );
   if (
     requestedVersion !== "master" &&
-    (await pathExists(path.join(requestedInstallDirectory, ".complete")))
+    (await hasVerifiedCacheMarker(
+      requestedInstallDirectory,
+      requestedVersion,
+    ))
   ) {
     await publishInstallation(
       requestedInstallDirectory,
@@ -373,7 +540,7 @@ export async function setup() {
   const installDirectory = path.join(cacheRoot, "zig", version, target);
   const completeMarker = path.join(installDirectory, ".complete");
 
-  if (await pathExists(completeMarker)) {
+  if (await hasVerifiedCacheMarker(installDirectory, version)) {
     await publishInstallation(installDirectory, version, true);
     return;
   }
@@ -403,7 +570,11 @@ export async function setup() {
     await fs.mkdir(path.dirname(installDirectory), { recursive: true });
     await fs.rm(installDirectory, { recursive: true, force: true });
     await moveDirectory(stagingDirectory, installDirectory);
-    await fs.writeFile(completeMarker, `${version}${EOL}`, "utf8");
+    await fs.writeFile(
+      completeMarker,
+      `${CACHE_MARKER_FORMAT}:${version}${EOL}`,
+      "utf8",
+    );
   } finally {
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   }

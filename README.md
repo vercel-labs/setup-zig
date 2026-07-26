@@ -14,8 +14,11 @@ steps:
 
 The action supports Linux, macOS, and Windows runners on architectures for
 which Zig publishes a binary archive. Downloads are selected from Zig's
-community mirrors and verified against the SHA-256 checksum in Zig's official
-download index.
+community mirrors and verified using Zig's minisign public key, including the
+signed archive filename. The SHA-256 checksum from Zig's official download
+index is checked as an additional integrity measure.
+
+The action has no package dependencies.
 
 ### Outputs
 
