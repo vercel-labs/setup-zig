@@ -6,7 +6,7 @@ Zig 0.16.0.
 ```yaml
 steps:
   - uses: actions/checkout@v6
-  - uses: vercel-labs/actions-setup-zig@v1
+  - uses: vercel-labs/setup-zig@v1
     with:
       version: 0.16.0
   - run: zig build

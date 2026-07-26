@@ -20,8 +20,8 @@ import { fileURLToPath } from "node:url";
 const DOWNLOAD_INDEX_URL = "https://ziglang.org/download/index.json";
 const COMMUNITY_MIRRORS_URL =
   "https://ziglang.org/download/community-mirrors.txt";
-const DOWNLOAD_SOURCE = "github-vercel-labs-actions-setup-zig";
-const USER_AGENT = "vercel-labs/actions-setup-zig";
+const DOWNLOAD_SOURCE = "github-vercel-labs-setup-zig";
+const USER_AGENT = "vercel-labs/setup-zig";
 
 function actionInput(name) {
   return process.env[`INPUT_${name.replaceAll("-", "_").toUpperCase()}`]?.trim();
