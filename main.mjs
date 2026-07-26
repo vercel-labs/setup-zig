@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import {
   createHash,
   createPublicKey,
+  randomUUID,
   timingSafeEqual,
   verify as verifySignature,
 } from "node:crypto";
@@ -10,6 +11,7 @@ import {
   createWriteStream,
   promises as fs,
 } from "node:fs";
+import * as http from "node:http";
 import {
   EOL,
   arch as hostArch,
@@ -20,6 +22,7 @@ import {
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const DOWNLOAD_INDEX_URL = "https://ziglang.org/download/index.json";
@@ -31,6 +34,39 @@ const ZIG_MINISIGN_PUBLIC_KEY =
   "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const CACHE_MARKER_FORMAT = "minisign-v1";
+const MAX_COMMUNITY_MIRROR_ATTEMPTS = 2;
+const COMMUNITY_DOWNLOAD_TIMEOUT_MILLISECONDS = 2 * 60_000;
+const OFFICIAL_DOWNLOAD_TIMEOUT_MILLISECONDS = 5 * 60_000;
+const INSTALLATION_LOCK_WAIT_MILLISECONDS = 3 * 60_000;
+const INSTALLATION_LOCK_STALE_MILLISECONDS = 2 * 60_000;
+const INSTALLATION_LOCK_POLL_MILLISECONDS = 250;
+const INSTALLATION_VALIDATION_TIMEOUT_MILLISECONDS = 30_000;
+const PROXY_ENVIRONMENT_VARIABLES = [
+  "HTTP_PROXY",
+  "http_proxy",
+  "HTTPS_PROXY",
+  "https_proxy",
+];
+
+export function configureProxyFromEnvironment(
+  environment = process.env,
+  setGlobalProxyFromEnv = http.setGlobalProxyFromEnv,
+) {
+  const hasProxy = PROXY_ENVIRONMENT_VARIABLES.some(
+    (name) => environment[name],
+  );
+  if (!hasProxy || environment.NODE_USE_ENV_PROXY === "1") {
+    return false;
+  }
+  if (typeof setGlobalProxyFromEnv !== "function") {
+    throw new Error(
+      "Proxy environment variables are set, but this Node 24 runtime cannot enable them dynamically. Set NODE_USE_ENV_PROXY=1 on the action step or update the runner.",
+    );
+  }
+
+  setGlobalProxyFromEnv(environment);
+  return true;
+}
 
 function actionInput(name) {
   return process.env[`INPUT_${name.replaceAll("-", "_").toUpperCase()}`]?.trim();
@@ -237,35 +273,67 @@ export function shuffled(items, random = Math.random) {
   return result;
 }
 
-async function candidateUrls(officialUrl) {
+export function candidateDownloadsFor(
+  officialUrl,
+  mirrorList,
+  random = Math.random,
+) {
   const archiveName = path.posix.basename(new URL(officialUrl).pathname);
-  let mirrors = [];
-
-  try {
-    const mirrorList = await fetchText(COMMUNITY_MIRRORS_URL);
-    mirrors = shuffled(
-      mirrorList
-        .split("\n")
-        .filter(Boolean)
-        .filter((url) => url.startsWith("https://")),
-    ).map((mirror) => {
+  const mirrorBases = mirrorList
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((value) => {
+      try {
+        return new URL(value).protocol === "https:";
+      } catch {
+        return false;
+      }
+    });
+  const mirrors = shuffled(mirrorBases, random)
+    .slice(0, MAX_COMMUNITY_MIRROR_ATTEMPTS)
+    .map((mirror) => {
       const url = new URL(`${mirror.replace(/\/$/, "")}/${archiveName}`);
       url.searchParams.set("source", DOWNLOAD_SOURCE);
-      return url.href;
+      return {
+        timeoutMilliseconds: COMMUNITY_DOWNLOAD_TIMEOUT_MILLISECONDS,
+        url: url.href,
+      };
     });
-  } catch (error) {
-    warning(`Could not load Zig's community mirror list: ${error.message}`);
-  }
 
-  return [...mirrors, officialUrl];
+  return [
+    ...mirrors,
+    {
+      timeoutMilliseconds: OFFICIAL_DOWNLOAD_TIMEOUT_MILLISECONDS,
+      url: officialUrl,
+    },
+  ];
 }
 
-export async function downloadFile(url, destination, expectedBytes) {
+async function candidateUrls(officialUrl) {
+  try {
+    const mirrorList = await fetchText(COMMUNITY_MIRRORS_URL);
+    return candidateDownloadsFor(officialUrl, mirrorList);
+  } catch (error) {
+    warning(`Could not load Zig's community mirror list: ${error.message}`);
+    return candidateDownloadsFor(officialUrl, "");
+  }
+}
+
+export async function downloadFile(
+  url,
+  destination,
+  expectedBytes,
+  timeoutMilliseconds = OFFICIAL_DOWNLOAD_TIMEOUT_MILLISECONDS,
+) {
   if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0) {
     throw new Error(`Invalid expected download size: ${expectedBytes}`);
   }
+  if (!Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds <= 0) {
+    throw new Error(`Invalid download timeout: ${timeoutMilliseconds}`);
+  }
 
-  const response = await fetchResponse(url, 5 * 60_000);
+  const response = await fetchResponse(url, timeoutMilliseconds);
   if (!response.body) {
     throw new Error("The response did not contain a body");
   }
@@ -450,11 +518,11 @@ async function downloadVerified(
   const failures = [];
   const archiveName = path.posix.basename(new URL(officialUrl).pathname);
 
-  for (const url of urls) {
+  for (const { timeoutMilliseconds, url } of urls) {
     try {
       await fs.rm(destination, { force: true });
       info(`Downloading Zig from ${new URL(url).origin}`);
-      await downloadFile(url, destination, expectedBytes);
+      await downloadFile(url, destination, expectedBytes, timeoutMilliseconds);
       const signatureText = await fetchText(
         signatureUrlFor(url),
         30_000,
@@ -480,7 +548,7 @@ async function downloadVerified(
   throw new Error(`Unable to download Zig:\n${failures.join("\n")}`);
 }
 
-async function run(command, argumentsList) {
+async function run(command, argumentsList, timeoutMilliseconds) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, argumentsList, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -488,17 +556,35 @@ async function run(command, argumentsList) {
     });
     const stdout = [];
     const stderr = [];
+    let timedOut = false;
+    const timeout =
+      timeoutMilliseconds === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+          }, timeoutMilliseconds);
 
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
     child.on("close", (code) => {
+      clearTimeout(timeout);
       const result = {
         stderr: Buffer.concat(stderr).toString("utf8"),
         stdout: Buffer.concat(stdout).toString("utf8"),
       };
 
-      if (code === 0) {
+      if (timedOut) {
+        reject(
+          new Error(
+            `${command} did not exit within ${timeoutMilliseconds} milliseconds`,
+          ),
+        );
+      } else if (code === 0) {
         resolve(result);
       } else {
         reject(
@@ -524,7 +610,11 @@ async function extractArchive(archive, destination) {
 }
 
 async function validateInstallation(zigPath, expectedVersion) {
-  const result = await run(zigPath, ["version"]);
+  const result = await run(
+    zigPath,
+    ["version"],
+    INSTALLATION_VALIDATION_TIMEOUT_MILLISECONDS,
+  );
   const actualVersion = result.stdout.trim();
   if (actualVersion !== expectedVersion) {
     throw new Error(
@@ -564,25 +654,83 @@ export async function hasUsableCachedInstallation(installDirectory, version) {
     warning(
       `Cached Zig ${version} is invalid and will be replaced: ${error.message}`,
     );
-    await fs.rm(installDirectory, { force: true, recursive: true });
     return false;
   }
 }
 
-async function moveDirectory(source, destination) {
-  try {
-    await fs.rename(source, destination);
-  } catch (error) {
-    if (error.code !== "EXDEV") {
+export async function acquireInstallationLock(
+  lockDirectory,
+  {
+    pollMilliseconds = INSTALLATION_LOCK_POLL_MILLISECONDS,
+    staleAfterMilliseconds = INSTALLATION_LOCK_STALE_MILLISECONDS,
+    waitTimeoutMilliseconds = INSTALLATION_LOCK_WAIT_MILLISECONDS,
+  } = {},
+) {
+  for (const [label, value] of [
+    ["poll interval", pollMilliseconds],
+    ["stale interval", staleAfterMilliseconds],
+    ["wait timeout", waitTimeoutMilliseconds],
+  ]) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`Invalid installation lock ${label}: ${value}`);
+    }
+  }
+
+  const deadline = Date.now() + waitTimeoutMilliseconds;
+  while (true) {
+    try {
+      await fs.mkdir(lockDirectory);
+      const owner = `${process.pid}:${randomUUID()}`;
+      const ownerFile = path.join(lockDirectory, "owner");
+      try {
+        await fs.writeFile(ownerFile, owner, { encoding: "utf8", flag: "wx" });
+      } catch (error) {
+        await fs.rm(lockDirectory, { force: true, recursive: true });
+        throw error;
+      }
+
+      let released = false;
+      return async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        try {
+          if ((await fs.readFile(ownerFile, "utf8")) === owner) {
+            await fs.rm(lockDirectory, { force: true, recursive: true });
+          }
+        } catch (error) {
+          if (error.code !== "ENOENT") {
+            throw error;
+          }
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    try {
+      const lock = await fs.stat(lockDirectory);
+      if (Date.now() - lock.mtimeMs >= staleAfterMilliseconds) {
+        await fs.rm(lockDirectory, { force: true, recursive: true });
+        continue;
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        continue;
+      }
       throw error;
     }
 
-    await fs.cp(source, destination, {
-      errorOnExist: true,
-      force: false,
-      recursive: true,
-    });
-    await fs.rm(source, { force: true, recursive: true });
+    const remainingMilliseconds = deadline - Date.now();
+    if (remainingMilliseconds <= 0) {
+      throw new Error(
+        `Timed out waiting for installation lock ${lockDirectory}`,
+      );
+    }
+    await delay(Math.min(pollMilliseconds, remainingMilliseconds));
   }
 }
 
@@ -635,10 +783,10 @@ export async function setup() {
     return;
   }
 
+  configureProxyFromEnvironment();
   const index = await fetchDownloadIndex();
   const { artifact, version } = artifactFor(index, requestedVersion, target);
   const installDirectory = path.join(cacheRoot, "zig", version, target);
-  const completeMarker = path.join(installDirectory, ".complete");
 
   if (await hasUsableCachedInstallation(installDirectory, version)) {
     await publishInstallation(installDirectory, version, true);
@@ -651,9 +799,15 @@ export async function setup() {
   );
   const archiveName = path.basename(new URL(artifact.tarball).pathname);
   const archive = path.join(temporaryDirectory, archiveName);
-  const stagingDirectory = path.join(temporaryDirectory, "install");
+  const installParent = path.dirname(installDirectory);
+  let stagingDirectory;
+  let cacheHit = false;
 
   try {
+    await fs.mkdir(installParent, { recursive: true });
+    stagingDirectory = await fs.mkdtemp(
+      path.join(installParent, ".setup-zig-"),
+    );
     await downloadVerified(
       artifact.tarball,
       artifact.shasum,
@@ -672,19 +826,38 @@ export async function setup() {
     }
     await validateInstallation(stagedExecutable, version);
 
-    await fs.mkdir(path.dirname(installDirectory), { recursive: true });
-    await fs.rm(installDirectory, { recursive: true, force: true });
-    await moveDirectory(stagingDirectory, installDirectory);
     await fs.writeFile(
-      completeMarker,
+      path.join(stagingDirectory, ".complete"),
       `${CACHE_MARKER_FORMAT}:${version}${EOL}`,
       "utf8",
     );
+
+    const releaseLock = await acquireInstallationLock(
+      `${installDirectory}.lock`,
+    );
+    try {
+      if (await hasUsableCachedInstallation(installDirectory, version)) {
+        cacheHit = true;
+      } else {
+        await fs.rm(installDirectory, { recursive: true, force: true });
+        await fs.rename(stagingDirectory, installDirectory);
+      }
+    } finally {
+      await releaseLock();
+    }
   } finally {
-    await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    const cleanup = [
+      fs.rm(temporaryDirectory, { recursive: true, force: true }),
+    ];
+    if (stagingDirectory !== undefined) {
+      cleanup.push(
+        fs.rm(stagingDirectory, { recursive: true, force: true }),
+      );
+    }
+    await Promise.all(cleanup);
   }
 
-  await publishInstallation(installDirectory, version, false);
+  await publishInstallation(installDirectory, version, cacheHit);
 }
 
 async function main() {

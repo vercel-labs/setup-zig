@@ -39,12 +39,26 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Reuse cached Zig
+        id: cached_zig
+        uses: ./
+        with:
+          version: 0.16.0
+
       - name: Verify Zig
         shell: bash
         env:
+          CACHE_HIT: ${{ steps.zig.outputs.cache-hit }}
+          CACHED_VERSION: ${{ steps.cached_zig.outputs.version }}
+          CACHED_ZIG_PATH: ${{ steps.cached_zig.outputs.zig-path }}
+          SECOND_CACHE_HIT: ${{ steps.cached_zig.outputs.cache-hit }}
           INSTALLED_VERSION: ${{ steps.zig.outputs.version }}
           ZIG_PATH: ${{ steps.zig.outputs.zig-path }}
         run: |
           test "$(zig version)" = "0.16.0"
           test "$INSTALLED_VERSION" = "0.16.0"
+          test "$CACHED_VERSION" = "0.16.0"
+          test "$CACHE_HIT" = "false"
+          test "$SECOND_CACHE_HIT" = "true"
+          test "$CACHED_ZIG_PATH" = "$ZIG_PATH"
           test -x "$ZIG_PATH" || test -f "$ZIG_PATH"

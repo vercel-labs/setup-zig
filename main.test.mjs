@@ -8,9 +8,13 @@ import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  acquireInstallationLock,
   artifactFor,
+  candidateDownloadsFor,
+  configureProxyFromEnvironment,
   downloadFile,
   hasUsableCachedInstallation,
   sha256,
@@ -18,6 +22,37 @@ import {
   targetFor,
   verifyMinisign,
 } from "./main.mjs";
+
+test("enables Node proxy support from standard runner variables", () => {
+  const environment = {
+    https_proxy: "http://proxy.example.test:8080",
+    no_proxy: "localhost",
+  };
+  let configuredEnvironment;
+
+  assert.equal(
+    configureProxyFromEnvironment(environment, (value) => {
+      configuredEnvironment = value;
+    }),
+    true,
+  );
+  assert.equal(configuredEnvironment, environment);
+  assert.equal(configureProxyFromEnvironment({}, assert.fail), false);
+  assert.equal(
+    configureProxyFromEnvironment(
+      {
+        HTTPS_PROXY: "http://proxy.example.test:8080",
+        NODE_USE_ENV_PROXY: "1",
+      },
+      assert.fail,
+    ),
+    false,
+  );
+  assert.throws(
+    () => configureProxyFromEnvironment(environment, null),
+    /cannot enable them dynamically/,
+  );
+});
 
 test("maps runner platforms to Zig targets", () => {
   assert.equal(targetFor("linux", "x64"), "x86_64-linux");
@@ -186,6 +221,39 @@ test("shuffles without modifying the input", () => {
   assert.deepEqual(input, ["a", "b", "c"]);
 });
 
+test("caps community mirrors and preserves the official fallback", () => {
+  const officialUrl =
+    "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz";
+  const candidates = candidateDownloadsFor(
+    officialUrl,
+    [
+      "https://one.example.test/zig",
+      "https://two.example.test/zig",
+      "http://insecure.example.test/zig",
+      "not a URL",
+      "https://three.example.test/zig",
+      "https://four.example.test/zig",
+      "",
+    ].join("\r\n"),
+    () => 0,
+  );
+
+  assert.equal(candidates.length, 3);
+  assert.deepEqual(candidates.at(-1), {
+    timeoutMilliseconds: 5 * 60_000,
+    url: officialUrl,
+  });
+  for (const candidate of candidates.slice(0, -1)) {
+    const url = new URL(candidate.url);
+    assert.equal(candidate.timeoutMilliseconds, 2 * 60_000);
+    assert.equal(
+      path.posix.basename(url.pathname),
+      "zig-x86_64-linux-0.16.0.tar.xz",
+    );
+    assert.equal(url.searchParams.get("source"), "github-vercel-labs-setup-zig");
+  }
+});
+
 test("computes a file SHA-256 checksum", async () => {
   const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
   const filename = path.join(directory, "fixture.txt");
@@ -224,7 +292,7 @@ test("enforces the expected download size while streaming", async () => {
   }
 });
 
-test("removes a marked cache entry when its executable is missing", async () => {
+test("does not mutate an invalid cache entry before publication", async () => {
   const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
   const installDirectory = path.join(directory, "install");
   await fs.mkdir(installDirectory);
@@ -238,7 +306,47 @@ test("removes a marked cache entry when its executable is missing", async () => 
       await hasUsableCachedInstallation(installDirectory, "0.16.0"),
       false,
     );
-    await assert.rejects(fs.access(installDirectory), { code: "ENOENT" });
+    await fs.access(installDirectory);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serializes installation publication with a recoverable lock", async () => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
+  const lockDirectory = path.join(directory, "install.lock");
+  const options = {
+    pollMilliseconds: 5,
+    staleAfterMilliseconds: 1_000,
+    waitTimeoutMilliseconds: 1_000,
+  };
+
+  try {
+    const releaseFirst = await acquireInstallationLock(lockDirectory, options);
+    let secondAcquired = false;
+    const secondLock = acquireInstallationLock(lockDirectory, options).then(
+      (release) => {
+        secondAcquired = true;
+        return release;
+      },
+    );
+
+    await delay(25);
+    assert.equal(secondAcquired, false);
+    await releaseFirst();
+
+    const releaseSecond = await secondLock;
+    assert.equal(secondAcquired, true);
+    await releaseSecond();
+
+    await fs.mkdir(lockDirectory);
+    const staleTime = new Date(Date.now() - 2_000);
+    await fs.utimes(lockDirectory, staleTime, staleTime);
+    const releaseRecovered = await acquireInstallationLock(
+      lockDirectory,
+      options,
+    );
+    await releaseRecovered();
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

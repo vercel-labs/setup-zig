@@ -28,6 +28,20 @@ The action has no package dependencies.
 | `zig-path` | The absolute path to the Zig executable |
 | `cache-hit` | Whether Zig was already present in the runner tool cache |
 
+### Proxy runners
+
+The action honors the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+environment variables. On a runner whose bundled Node 24 predates dynamic proxy
+support, set `NODE_USE_ENV_PROXY: "1"` on the action step or update the runner:
+
+```yaml
+- uses: vercel-labs/setup-zig@v1
+  env:
+    HTTPS_PROXY: http://proxy.example.com:8080
+    NO_PROXY: localhost,127.0.0.1
+    NODE_USE_ENV_PROXY: "1"
+```
+
 ## Development
 
 Run the dependency-free test suite with:
