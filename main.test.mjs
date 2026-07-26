@@ -11,6 +11,8 @@ import test from "node:test";
 
 import {
   artifactFor,
+  downloadFile,
+  hasUsableCachedInstallation,
   sha256,
   shuffled,
   targetFor,
@@ -36,6 +38,7 @@ test("selects a versioned artifact from the download index", () => {
     "0.16.0": {
       version: "0.16.0",
       "aarch64-macos": {
+        size: "3",
         tarball: "https://example.test/zig.tar.xz",
         shasum: "abc123",
       },
@@ -45,10 +48,100 @@ test("selects a versioned artifact from the download index", () => {
   assert.deepEqual(artifactFor(index, "0.16.0", "aarch64-macos"), {
     version: "0.16.0",
     artifact: {
+      size: "3",
       tarball: "https://example.test/zig.tar.xz",
       shasum: "abc123",
     },
   });
+});
+
+test("uses the requested version when legacy index entries omit version", () => {
+  const artifact = {
+    size: "3",
+    tarball: "https://example.test/zig.tar.xz",
+    shasum: "abc123",
+  };
+
+  assert.deepEqual(
+    artifactFor(
+      { "0.15.1": { "x86_64-linux": artifact } },
+      "0.15.1",
+      "x86_64-linux",
+    ),
+    {
+      artifact,
+      version: "0.15.1",
+    },
+  );
+});
+
+test("requires master index entries to provide a resolved version", () => {
+  assert.throws(
+    () =>
+      artifactFor(
+        {
+          master: {
+            "x86_64-linux": {
+              size: "3",
+              tarball: "https://example.test/zig.tar.xz",
+              shasum: "abc123",
+            },
+          },
+        },
+        "master",
+        "x86_64-linux",
+      ),
+    /resolved version/,
+  );
+});
+
+test("rejects a stable index entry that resolves to another version", () => {
+  assert.throws(
+    () =>
+      artifactFor(
+        {
+          "0.16.0": {
+            version: "0.15.1",
+            "x86_64-linux": {
+              size: "3",
+              tarball: "https://example.test/zig.tar.xz",
+              shasum: "abc123",
+            },
+          },
+        },
+        "0.16.0",
+        "x86_64-linux",
+      ),
+    /resolved 0\.16\.0 as 0\.15\.1/,
+  );
+});
+
+test("selects legacy ARM and x86 target aliases", () => {
+  const armArtifact = {
+    size: "3",
+    tarball: "https://example.test/zig-armv7a.tar.xz",
+    shasum: "arm",
+  };
+  const x86Artifact = {
+    size: "3",
+    tarball: "https://example.test/zig-i386.tar.xz",
+    shasum: "x86",
+  };
+  const index = {
+    "0.10.0": {
+      "armv7a-linux": armArtifact,
+      "i386-linux": x86Artifact,
+    },
+  };
+
+  assert.equal(
+    artifactFor(index, "0.10.0", "arm-linux").artifact,
+    armArtifact,
+  );
+  assert.equal(
+    artifactFor(index, "0.10.0", "x86-linux").artifact,
+    x86Artifact,
+  );
 });
 
 test("reports missing versions and targets clearly", () => {
@@ -64,6 +157,26 @@ test("reports missing versions and targets clearly", () => {
         "x86_64-linux",
       ),
     /does not publish a binary/,
+  );
+});
+
+test("rejects invalid archive sizes in the download index", () => {
+  assert.throws(
+    () =>
+      artifactFor(
+        {
+          "0.16.0": {
+            "x86_64-linux": {
+              size: "unknown",
+              tarball: "https://example.test/zig.tar.xz",
+              shasum: "abc123",
+            },
+          },
+        },
+        "0.16.0",
+        "x86_64-linux",
+      ),
+    /invalid archive size/,
   );
 });
 
@@ -83,6 +196,49 @@ test("computes a file SHA-256 checksum", async () => {
       await sha256(filename),
       "77ebfe9993f116e089f21a982b4afcb67e3761529a29b52d5c88c65b467514e4",
     );
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("enforces the expected download size while streaming", async () => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
+  const exactFile = path.join(directory, "exact");
+  const oversizedFile = path.join(directory, "oversized");
+  const undersizedFile = path.join(directory, "undersized");
+  const url = "data:application/octet-stream;base64,emln";
+
+  try {
+    await downloadFile(url, exactFile, 3);
+    assert.equal(await fs.readFile(exactFile, "utf8"), "zig");
+    await assert.rejects(
+      downloadFile(url, oversizedFile, 2),
+      /exceeds 2 bytes/,
+    );
+    await assert.rejects(
+      downloadFile(url, undersizedFile, 4),
+      /contained 3 bytes, expected 4/,
+    );
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("removes a marked cache entry when its executable is missing", async () => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
+  const installDirectory = path.join(directory, "install");
+  await fs.mkdir(installDirectory);
+  await fs.writeFile(
+    path.join(installDirectory, ".complete"),
+    "minisign-v1:0.16.0\n",
+  );
+
+  try {
+    assert.equal(
+      await hasUsableCachedInstallation(installDirectory, "0.16.0"),
+      false,
+    );
+    await assert.rejects(fs.access(installDirectory), { code: "ENOENT" });
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

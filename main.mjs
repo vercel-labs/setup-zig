@@ -18,7 +18,7 @@ import {
   tmpdir,
 } from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
@@ -122,16 +122,51 @@ export function artifactFor(index, requestedVersion, target) {
     );
   }
 
-  const artifact = release[target];
+  const [architecture, ...platformParts] = target.split("-");
+  const platform = platformParts.join("-");
+  const compatibleTargets = [target];
+  if (architecture === "arm") {
+    compatibleTargets.push(`armv7a-${platform}`, `armv6kz-${platform}`);
+  } else if (architecture === "x86") {
+    compatibleTargets.push(`i386-${platform}`);
+  }
+
+  const artifact = compatibleTargets
+    .map((compatibleTarget) => release[compatibleTarget])
+    .find((candidate) => candidate?.tarball && candidate?.shasum);
   if (!artifact?.tarball || !artifact?.shasum) {
     throw new Error(
       `Zig ${requestedVersion} does not publish a binary for ${target}`,
     );
   }
 
+  const size = Number(artifact.size);
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    throw new Error(
+      `Zig ${requestedVersion} publishes an invalid archive size for ${target}`,
+    );
+  }
+
+  let version = requestedVersion;
+  if (requestedVersion === "master") {
+    if (typeof release.version !== "string" || !release.version) {
+      throw new Error(
+        "Zig's download index did not provide a resolved version for master",
+      );
+    }
+    version = release.version;
+  } else if (
+    release.version !== undefined &&
+    release.version !== requestedVersion
+  ) {
+    throw new Error(
+      `Zig's download index resolved ${requestedVersion} as ${release.version}`,
+    );
+  }
+
   return {
     artifact,
-    version: release.version,
+    version,
   };
 }
 
@@ -225,16 +260,55 @@ async function candidateUrls(officialUrl) {
   return [...mirrors, officialUrl];
 }
 
-async function downloadFile(url, destination) {
+export async function downloadFile(url, destination, expectedBytes) {
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0) {
+    throw new Error(`Invalid expected download size: ${expectedBytes}`);
+  }
+
   const response = await fetchResponse(url, 5 * 60_000);
   if (!response.body) {
     throw new Error("The response did not contain a body");
   }
 
+  const contentLengthHeader = response.headers.get("content-length");
+  const contentEncoding = response.headers.get("content-encoding");
+  if (
+    contentLengthHeader !== null &&
+    (!contentEncoding || contentEncoding === "identity")
+  ) {
+    const contentLength = Number(contentLengthHeader);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+      throw new Error(`Response from ${url} has an invalid Content-Length`);
+    }
+    if (contentLength > expectedBytes) {
+      throw new Error(`Response from ${url} exceeds ${expectedBytes} bytes`);
+    }
+  }
+
+  let downloadedBytes = 0;
+  const byteLimiter = new Transform({
+    transform(chunk, encoding, callback) {
+      downloadedBytes += chunk.length;
+      if (downloadedBytes > expectedBytes) {
+        callback(
+          new Error(`Response from ${url} exceeds ${expectedBytes} bytes`),
+        );
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+
   await pipeline(
     Readable.fromWeb(response.body),
+    byteLimiter,
     createWriteStream(destination, { flags: "wx" }),
   );
+  if (downloadedBytes !== expectedBytes) {
+    throw new Error(
+      `Response from ${url} contained ${downloadedBytes} bytes, expected ${expectedBytes}`,
+    );
+  }
 }
 
 export async function sha256(filename) {
@@ -366,7 +440,12 @@ function signatureUrlFor(archiveUrl) {
   return signatureUrl.href;
 }
 
-async function downloadVerified(officialUrl, expectedChecksum, destination) {
+async function downloadVerified(
+  officialUrl,
+  expectedChecksum,
+  expectedBytes,
+  destination,
+) {
   const urls = await candidateUrls(officialUrl);
   const failures = [];
   const archiveName = path.posix.basename(new URL(officialUrl).pathname);
@@ -375,7 +454,7 @@ async function downloadVerified(officialUrl, expectedChecksum, destination) {
     try {
       await fs.rm(destination, { force: true });
       info(`Downloading Zig from ${new URL(url).origin}`);
-      await downloadFile(url, destination);
+      await downloadFile(url, destination, expectedBytes);
       const signatureText = await fetchText(
         signatureUrlFor(url),
         30_000,
@@ -466,6 +545,30 @@ async function hasVerifiedCacheMarker(installDirectory, version) {
   }
 }
 
+function executableFor(installDirectory) {
+  return path.join(
+    installDirectory,
+    hostPlatform() === "win32" ? "zig.exe" : "zig",
+  );
+}
+
+export async function hasUsableCachedInstallation(installDirectory, version) {
+  if (!(await hasVerifiedCacheMarker(installDirectory, version))) {
+    return false;
+  }
+
+  try {
+    await validateInstallation(executableFor(installDirectory), version);
+    return true;
+  } catch (error) {
+    warning(
+      `Cached Zig ${version} is invalid and will be replaced: ${error.message}`,
+    );
+    await fs.rm(installDirectory, { force: true, recursive: true });
+    return false;
+  }
+}
+
 async function moveDirectory(source, destination) {
   try {
     await fs.rename(source, destination);
@@ -484,10 +587,7 @@ async function moveDirectory(source, destination) {
 }
 
 async function publishInstallation(installDirectory, version, cacheHit) {
-  const executable = path.join(
-    installDirectory,
-    hostPlatform() === "win32" ? "zig.exe" : "zig",
-  );
+  const executable = executableFor(installDirectory);
 
   await validateInstallation(executable, version);
   await addPath(installDirectory);
@@ -522,7 +622,7 @@ export async function setup() {
   );
   if (
     requestedVersion !== "master" &&
-    (await hasVerifiedCacheMarker(
+    (await hasUsableCachedInstallation(
       requestedInstallDirectory,
       requestedVersion,
     ))
@@ -540,7 +640,7 @@ export async function setup() {
   const installDirectory = path.join(cacheRoot, "zig", version, target);
   const completeMarker = path.join(installDirectory, ".complete");
 
-  if (await hasVerifiedCacheMarker(installDirectory, version)) {
+  if (await hasUsableCachedInstallation(installDirectory, version)) {
     await publishInstallation(installDirectory, version, true);
     return;
   }
@@ -554,7 +654,12 @@ export async function setup() {
   const stagingDirectory = path.join(temporaryDirectory, "install");
 
   try {
-    await downloadVerified(artifact.tarball, artifact.shasum, archive);
+    await downloadVerified(
+      artifact.tarball,
+      artifact.shasum,
+      Number(artifact.size),
+      archive,
+    );
     info("Extracting Zig");
     await extractArchive(archive, stagingDirectory);
 
