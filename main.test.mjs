@@ -130,6 +130,55 @@ test("requires master index entries to provide a resolved version", () => {
   );
 });
 
+test("resolves the current master build by its exact development version", () => {
+  const artifact = {
+    size: "3",
+    tarball:
+      "https://example.test/zig-x86_64-linux-0.17.0-dev.1465+8b2d0ce21.tar.xz",
+    shasum: "abc123",
+  };
+  const index = {
+    master: {
+      version: "0.17.0-dev.1465+8b2d0ce21",
+      "x86_64-linux": artifact,
+    },
+  };
+
+  assert.deepEqual(
+    artifactFor(
+      index,
+      "0.17.0-dev.1465+8b2d0ce21",
+      "x86_64-linux",
+    ),
+    {
+      artifact,
+      version: "0.17.0-dev.1465+8b2d0ce21",
+    },
+  );
+});
+
+test("rejects development versions other than the current master build", () => {
+  assert.throws(
+    () =>
+      artifactFor(
+        {
+          master: {
+            version: "0.17.0-dev.1465+8b2d0ce21",
+            "x86_64-linux": {
+              size: "3",
+              tarball:
+                "https://example.test/zig-x86_64-linux-0.17.0-dev.1465+8b2d0ce21.tar.xz",
+              shasum: "abc123",
+            },
+          },
+        },
+        "0.17.0-dev.1400+abcdef123",
+        "x86_64-linux",
+      ),
+    /was not found/,
+  );
+});
+
 test("rejects a stable index entry that resolves to another version", () => {
   assert.throws(
     () =>

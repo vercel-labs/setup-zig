@@ -151,7 +151,13 @@ export function targetFor(
 }
 
 export function artifactFor(index, requestedVersion, target) {
-  const release = index[requestedVersion];
+  const exactRelease = index[requestedVersion];
+  const currentDevelopmentRelease =
+    requestedVersion !== "master" &&
+    index.master?.version === requestedVersion
+      ? index.master
+      : undefined;
+  const release = exactRelease ?? currentDevelopmentRelease;
   if (!release) {
     throw new Error(
       `Zig version "${requestedVersion}" was not found in the official download index`,
