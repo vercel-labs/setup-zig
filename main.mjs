@@ -658,6 +658,121 @@ export async function hasUsableCachedInstallation(installDirectory, version) {
   }
 }
 
+async function installationLockOwner(ownerFile) {
+  try {
+    const owner = await fs.readFile(ownerFile, "utf8");
+    const status = await fs.stat(ownerFile);
+    const confirmedOwner = await fs.readFile(ownerFile, "utf8");
+    if (confirmedOwner !== owner) {
+      return {
+        modifiedAtMilliseconds: Date.now(),
+        owner: confirmedOwner,
+      };
+    }
+    return {
+      modifiedAtMilliseconds: status.mtimeMs,
+      owner,
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function recoverStaleInstallationLock(
+  lockDirectory,
+  staleAfterMilliseconds,
+) {
+  const ownerFile = path.join(lockDirectory, "owner");
+  const observedOwner = await installationLockOwner(ownerFile);
+  if (observedOwner !== undefined) {
+    if (
+      Date.now() - observedOwner.modifiedAtMilliseconds <
+      staleAfterMilliseconds
+    ) {
+      return false;
+    }
+
+    const displacedOwnerFile = path.join(
+      lockDirectory,
+      `owner.reaping-${randomUUID()}`,
+    );
+    try {
+      await fs.rename(ownerFile, displacedOwnerFile);
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+
+    let displacedOwner;
+    try {
+      displacedOwner = await fs.readFile(displacedOwnerFile, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+    if (displacedOwner !== observedOwner.owner) {
+      try {
+        await fs.writeFile(ownerFile, displacedOwner, {
+          encoding: "utf8",
+          flag: "wx",
+        });
+      } catch (error) {
+        if (error.code !== "EEXIST" && error.code !== "ENOENT") {
+          throw error;
+        }
+      }
+      await fs.rm(displacedOwnerFile, { force: true });
+      return false;
+    }
+  } else {
+    let lock;
+    try {
+      lock = await fs.stat(lockDirectory);
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+    if (Date.now() - lock.mtimeMs < staleAfterMilliseconds) {
+      return false;
+    }
+  }
+
+  const reaper = `reaper:${process.pid}:${randomUUID()}`;
+  try {
+    await fs.writeFile(ownerFile, reaper, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+  } catch (error) {
+    if (error.code === "EEXIST" || error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+
+  try {
+    if ((await fs.readFile(ownerFile, "utf8")) !== reaper) {
+      return false;
+    }
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return true;
+    }
+    throw error;
+  }
+  await fs.rm(lockDirectory, { force: true, recursive: true });
+  return true;
+}
+
 export async function acquireInstallationLock(
   lockDirectory,
   {
@@ -682,46 +797,81 @@ export async function acquireInstallationLock(
       await fs.mkdir(lockDirectory);
       const owner = `${process.pid}:${randomUUID()}`;
       const ownerFile = path.join(lockDirectory, "owner");
+      await fs.writeFile(ownerFile, owner, { encoding: "utf8", flag: "wx" });
+
+      let confirmedOwner;
       try {
-        await fs.writeFile(ownerFile, owner, { encoding: "utf8", flag: "wx" });
+        confirmedOwner = await fs.readFile(ownerFile, "utf8");
       } catch (error) {
-        await fs.rm(lockDirectory, { force: true, recursive: true });
+        if (error.code === "ENOENT") {
+          continue;
+        }
         throw error;
       }
+      if (confirmedOwner !== owner) {
+        continue;
+      }
 
-      let released = false;
+      let heartbeat = Promise.resolve();
+      let heartbeatError;
+      const lockOwnershipError = () =>
+        new Error(`Installation lock ownership was lost: ${lockDirectory}`);
+      const heartbeatTimer = setInterval(() => {
+        heartbeat = heartbeat.then(async () => {
+          if (heartbeatError !== undefined) {
+            return;
+          }
+          try {
+            if ((await fs.readFile(ownerFile, "utf8")) !== owner) {
+              heartbeatError = lockOwnershipError();
+              return;
+            }
+            const now = new Date();
+            await fs.utimes(ownerFile, now, now);
+          } catch (error) {
+            heartbeatError =
+              error.code === "ENOENT" ? lockOwnershipError() : error;
+          }
+        });
+      }, Math.max(1, Math.floor(staleAfterMilliseconds / 3)));
+      heartbeatTimer.unref();
+
+      let releasePromise;
       return async () => {
-        if (released) {
-          return;
+        if (releasePromise === undefined) {
+          releasePromise = (async () => {
+            clearInterval(heartbeatTimer);
+            await heartbeat;
+            try {
+              if ((await fs.readFile(ownerFile, "utf8")) === owner) {
+                await fs.rm(lockDirectory, { force: true, recursive: true });
+              } else if (heartbeatError === undefined) {
+                heartbeatError = lockOwnershipError();
+              }
+            } catch (error) {
+              heartbeatError =
+                error.code === "ENOENT" ? lockOwnershipError() : error;
+            }
+            if (heartbeatError !== undefined) {
+              throw heartbeatError;
+            }
+          })();
         }
-        released = true;
-        try {
-          if ((await fs.readFile(ownerFile, "utf8")) === owner) {
-            await fs.rm(lockDirectory, { force: true, recursive: true });
-          }
-        } catch (error) {
-          if (error.code !== "ENOENT") {
-            throw error;
-          }
-        }
+        return releasePromise;
       };
     } catch (error) {
-      if (error.code !== "EEXIST") {
+      if (error.code !== "EEXIST" && error.code !== "ENOENT") {
         throw error;
       }
     }
 
-    try {
-      const lock = await fs.stat(lockDirectory);
-      if (Date.now() - lock.mtimeMs >= staleAfterMilliseconds) {
-        await fs.rm(lockDirectory, { force: true, recursive: true });
-        continue;
-      }
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        continue;
-      }
-      throw error;
+    if (
+      await recoverStaleInstallationLock(
+        lockDirectory,
+        staleAfterMilliseconds,
+      )
+    ) {
+      continue;
     }
 
     const remainingMilliseconds = deadline - Date.now();

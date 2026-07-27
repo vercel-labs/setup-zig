@@ -342,11 +342,81 @@ test("serializes installation publication with a recoverable lock", async () => 
     await fs.mkdir(lockDirectory);
     const staleTime = new Date(Date.now() - 2_000);
     await fs.utimes(lockDirectory, staleTime, staleTime);
-    const releaseRecovered = await acquireInstallationLock(
+    const releaseEmptyLock = await acquireInstallationLock(
       lockDirectory,
       options,
     );
-    await releaseRecovered();
+    await releaseEmptyLock();
+
+    await fs.mkdir(lockDirectory);
+    const abandonedOwnerFile = path.join(lockDirectory, "owner");
+    await fs.writeFile(abandonedOwnerFile, "abandoned");
+    await fs.utimes(abandonedOwnerFile, staleTime, staleTime);
+    let activeLocks = 0;
+    let maximumActiveLocks = 0;
+    await Promise.all(
+      Array.from({ length: 50 }, async () => {
+        const releaseRecovered = await acquireInstallationLock(lockDirectory, {
+          ...options,
+          waitTimeoutMilliseconds: 5_000,
+        });
+        activeLocks += 1;
+        maximumActiveLocks = Math.max(maximumActiveLocks, activeLocks);
+        await delay(10);
+        activeLocks -= 1;
+        await releaseRecovered();
+      }),
+    );
+    assert.equal(maximumActiveLocks, 1);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("renews an installation lock while it remains held", async () => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
+  const lockDirectory = path.join(directory, "install.lock");
+  const options = {
+    pollMilliseconds: 5,
+    staleAfterMilliseconds: 60,
+    waitTimeoutMilliseconds: 1_000,
+  };
+
+  try {
+    const releaseFirst = await acquireInstallationLock(lockDirectory, options);
+    let secondAcquired = false;
+    const secondLock = acquireInstallationLock(lockDirectory, options).then(
+      (release) => {
+        secondAcquired = true;
+        return release;
+      },
+    );
+
+    await delay(180);
+    assert.equal(secondAcquired, false);
+    await releaseFirst();
+    const releaseSecond = await secondLock;
+    await releaseSecond();
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not remove a replacement installation lock", async () => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), "setup-zig-test-"));
+  const lockDirectory = path.join(directory, "install.lock");
+
+  try {
+    const release = await acquireInstallationLock(lockDirectory);
+    await fs.rm(lockDirectory, { recursive: true });
+    await fs.mkdir(lockDirectory);
+    await fs.writeFile(path.join(lockDirectory, "owner"), "replacement");
+
+    await assert.rejects(release(), /lock ownership was lost/);
+    assert.equal(
+      await fs.readFile(path.join(lockDirectory, "owner"), "utf8"),
+      "replacement",
+    );
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
